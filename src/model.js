@@ -4,14 +4,21 @@
 //   Para       = { spans: [Span], ins: revId|null, delBreak: revId|null }
 //     - ins:      本段落由其前的换行产生，该换行是一笔“插入”修订
 //     - delBreak: 本段落之后的换行被一笔“删除”修订标记删除
-//   Span       = { text, bold, ins: revId|null, del: revId|null }
+//   Span       = { text, bold, ins, del, delIns }
+//     - ins:    本 span 是未接受的插入修订（id）
+//     - del:    本 span 被一笔删除修订标记（id），文字仍保留
+//     - delIns: 仅用于 ins span：“替换”修订的新词；它是存活的插入，
+//               但当对应删除修订（delIns = 该删除 id）被接受时随之移除。
+//               与 del 分开存储，使删除/插入两条修订身份各自独立。
 //
 // 位置约定：全文线性字符偏移，每段文本之后计 1 个换行偏移（最后一段除外）。
 // 被标记删除（del）的文字仍保留在模型中并计入偏移，编辑器以删除线显示；
 // 阅读视图与导出会将其过滤（见 derive.js）。
 
-export function span(text, { bold = false, ins = null, del = null } = {}) {
-  return { text, bold, ins, del };
+export function span(text, { bold = false, ins = null, del = null, delIns = null } = {}) {
+  const s = { text, bold, ins, del };
+  if (delIns != null) s.delIns = delIns;
+  return s;
 }
 
 export function paragraph(spans = [], { ins = null, delBreak = null } = {}) {
@@ -52,7 +59,8 @@ export function normalize(doc) {
     for (const s of p.spans) {
       if (!s.text) continue;
       const last = out[out.length - 1];
-      if (last && last.bold === s.bold && last.ins === s.ins && last.del === s.del) {
+      if (last && last.bold === s.bold && last.ins === s.ins
+        && last.del === s.del && (last.delIns ?? null) === (s.delIns ?? null)) {
         last.text += s.text;
       } else {
         out.push({ ...s });
@@ -108,7 +116,8 @@ export function locateInPara(doc, offset) {
 }
 
 function sameMarks(a, b) {
-  return a.bold === b.bold && a.ins === b.ins && a.del === b.del;
+  return a.bold === b.bold && a.ins === b.ins && a.del === b.del
+    && (a.delIns ?? null) === (b.delIns ?? null);
 }
 
 // 在 char 处把 spans 切成左右两半（char 为段内字符偏移）。
@@ -265,6 +274,49 @@ export function insertParagraphs(doc, offset, paras, attrs = {}) {
   return inserted;
 }
 
+// 非修订替换：同段 [from, to) 原位换为 segments [{ text, bold }]，
+// 段外格式与段界均不被触碰。供“查找并全部替换”逐处使用。
+export function replaceRangePlain(doc, from, to, segments) {
+  if (from > to) [from, to] = [to, from];
+  const a = locateInPara(doc, from);
+  const b = locateInPara(doc, to);
+  if (a.para !== b.para || from === to) return doc;
+  const p = doc.paragraphs[a.para];
+  const { left, right } = splitSpansAt2(p.spans, a.char, b.char);
+  const mid = segments
+    .filter((s) => s.text)
+    .map((s) => span(s.text, { bold: !!s.bold }));
+  p.spans = [...left, ...mid, ...right];
+  return normalize(doc);
+}
+
+// 修订替换：同段 [from, to) 的旧文字标 delRevId（不动既有修订身份），
+// 随后插入以 insRevId 标记的 segments。删除与插入各持独立修订身份，
+// 可在修订表中分别接受/拒绝。
+//
+// 替换新词是存活的插入（阅读视图可见），但携带 delIns=delRevId：
+// 接受该删除修订时新词随旧词一并移除（“整处替换被接受删除”）；
+// 只拒绝插入则新词移除、旧删除标记仍在；只拒绝删除则旧词恢复、新词仍在。
+export function replaceRangeTracked(doc, from, to, segments, delRevId, insRevId) {
+  if (from > to) [from, to] = [to, from];
+  const a = locateInPara(doc, from);
+  const b = locateInPara(doc, to);
+  if (a.para !== b.para || from === to) return doc;
+  const p = doc.paragraphs[a.para];
+  const split = splitSpansAt2(p.spans, a.char, b.char);
+  const mid = [];
+  for (const s of split.mid) {
+    // 命中范围内的未接受插入理论上已在匹配阶段被跳过；仍做防御性处理。
+    if (s.ins != null) continue;
+    mid.push(s.del != null ? s : { ...s, del: delRevId });
+  }
+  const ins = segments
+    .filter((s) => s.text)
+    .map((s) => span(s.text, { bold: !!s.bold, ins: insRevId, delIns: delRevId }));
+  p.spans = [...split.left, ...mid, ...ins, ...split.right];
+  return normalize(doc);
+}
+
 export function setBold(doc, from, to, bold) {
   const a = locateInPara(doc, from);
   const b = locateInPara(doc, to);
@@ -317,10 +369,11 @@ export function acceptRevision(doc, revId) {
     let cur = offset;
     const spans = [];
     for (const s of p.spans) {
-      if (s.del === revId) {
+      if (s.del === revId || s.delIns === revId) {
+        // del：被删旧词；delIns：随该删除一并移除的替换新词
         removals.push({ start: cur, end: cur + s.text.length });
       } else {
-        spans.push(s.ins === revId ? { ...s, ins: null } : s);
+        spans.push(s.ins === revId ? { ...s, ins: null, delIns: null } : s);
       }
       cur += s.text.length;
     }
@@ -357,7 +410,15 @@ export function rejectRevision(doc, revId) {
       if (s.ins === revId) {
         removals.push({ start: cur, end: cur + s.text.length });
       } else {
-        spans.push(s.del === revId ? { ...s, del: null } : s);
+        // 拒绝删除：清除旧词的 del，以及替换新词与该删除的绑定
+        if (s.del === revId || s.delIns === revId) {
+          const ns = { ...s };
+          if (ns.del === revId) ns.del = null;
+          if (ns.delIns === revId) delete ns.delIns;
+          spans.push(ns);
+        } else {
+          spans.push(s);
+        }
       }
       cur += s.text.length;
     }

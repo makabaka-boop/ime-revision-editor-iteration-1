@@ -8,11 +8,13 @@ import {
   locate, offsetOf, insertTextInto, deleteRange, markDeleted, splitParagraph,
   insertParagraphs, setBold, allBold, insertionAttrs,
   acceptRevision, rejectRevision, mapThroughRemovals,
+  replaceRangePlain, replaceRangeTracked,
 } from '../src/model.js';
 import { finalParagraphs, exportHtml, exportText, listRevisions } from '../src/derive.js';
 import { sanitizeHtml, textToParagraphs, decodeEntities } from '../src/sanitize.js';
 import { Editor } from '../src/editor.js';
 import { DomView, domPositionFromModelOffset, modelOffsetFromDomPosition } from '../src/domview.js';
+import { findAll, segmentsFor } from '../src/find.js';
 
 // ---------- 微型测试框架 ----------
 
@@ -835,6 +837,435 @@ test('拆段/并段后 DOM 映射仍指向正确字符', () => {
   const root2 = renderToFake(ed.doc, ed.sel);
   const pos2 = domPositionFromModelOffset(root2, ed.sel.anchor);
   eq(modelOffsetFromDomPosition(root2, pos2.node, pos2.offset), 2);
+});
+
+// ---------- 查找并全部替换 ----------
+
+// 构造文档：paras = [['普通串', ['粗体串'] , { ins:text } | { del:text, id? } ...]]
+function buildDoc(paras) {
+  const doc = createDoc();
+  let first = true;
+  for (const toks of paras) {
+    if (!first) splitParagraph(doc, textLength(doc));
+    first = false;
+    for (const t of toks) {
+      if (typeof t === 'string') insertTextInto(doc, textLength(doc), t, {});
+      else if (Array.isArray(t)) insertTextInto(doc, textLength(doc), t[0], { bold: true });
+      else if ('ins' in t) insertTextInto(doc, textLength(doc), t.ins, { ins: t.id ?? 99 });
+      else if ('del' in t) insertTextInto(doc, textLength(doc), t.del, { del: t.id ?? 98 });
+    }
+  }
+  return doc;
+}
+
+test('segmentsFor：替换词按命中字符对位继承粗体，多余字符沿用末位', () => {
+  eq(segmentsFor('xx', [false, false]), [{ text: 'xx', bold: false }]);
+  eq(segmentsFor('XY', [false, true]), [
+    { text: 'X', bold: false }, { text: 'Y', bold: true },
+  ]);
+  // 替换词比命中长：尾部沿用命中最后一个字符的粗体
+  eq(segmentsFor('ABCD', [false, true]), [
+    { text: 'A', bold: false }, { text: 'BCD', bold: true },
+  ]);
+  eq(segmentsFor('Z', [true]), [{ text: 'Z', bold: true }]);
+});
+
+test('匹配：区分大小写、非重叠，允许跨加粗 span', () => {
+  const doc = buildDoc([['aA', ['aA'], 'tail']]); // 可见文字 aAaAtail
+  const r = findAll(doc, 'aA');
+  eq(r.matches.length, 2, '区分大小写：小写 aa / 大写 AA 不匹配');
+  eq(r.matches[0].from, 0);
+  eq(r.matches[1].from, 2, '第二处跨越普通/加粗 span 边界');
+  eq(r.skipped.length, 0);
+  // 非重叠：'aaaa' 查 'aa' 为 2 处（位置 0、2），不产生位置 1 的重叠命中
+  const doc2 = buildDoc([['xaaaax']]);
+  const r2 = findAll(doc2, 'aa');
+  eq(r2.matches.length, 2);
+  eq(r2.matches.map((m) => m.from), [1, 3]);
+  // 'aaa' 查 'aa' 仅 1 处
+  eq(findAll(buildDoc([['xaaax']]), 'aa').matches.length, 1);
+});
+
+test('匹配不跨段落；逐行各自匹配', () => {
+  const doc = buildDoc([['ab'], ['ab']]);
+  const r = findAll(doc, 'ab');
+  eq(r.matches.length, 2);
+  eq(r.matches[0].para, 0);
+  eq(r.matches[0].from, 0);
+  eq(r.matches[0].to, 2);
+  eq(r.matches[1].para, 1);
+  eq(r.matches[1].from, 3); // p1 起点：2 + 换行
+  eq(r.matches[1].to, 5);
+  // 跨行的词不命中（换行不是可见字符，逐行匹配）
+  eq(findAll(doc, 'b\na').matches.length, 0);
+  eq(findAll(doc, 'b' + String.fromCharCode(10) + 'a').matches.length, 0);
+});
+
+test('匹配命中含未决插入/删除：跳过并报告，不碰既有修订身份', () => {
+  // 'acb'，其中 c 是未决插入；查 'acb' 应跳过；查 'ab' 命中（不连续夹插？ab不相邻）
+  const doc = buildDoc([['a', { ins: 'c', id: 7 }, 'b']]);
+  const r = findAll(doc, 'acb');
+  eq(r.matches.length, 0);
+  eq(r.skipped.length, 1);
+  eq(r.skipped[0].reason, 'insert');
+  // 文档身份未变
+  ok(JSON.stringify(doc).includes('"ins":7'), '插入修订身份保留');
+
+  // 命中范围含未决删除文字（阅读视图隐藏，可见串拼接跨过它）
+  const doc2 = buildDoc([['a', { del: 'X', id: 8 }, 'b']]); // 可见 'ab'
+  const r2 = findAll(doc2, 'ab');
+  eq(r2.matches.length, 0);
+  eq(r2.skipped.length, 1);
+  eq(r2.skipped[0].reason, 'delete');
+  ok(JSON.stringify(doc2).includes('"del":8'), '删除修订身份保留');
+});
+
+test('匹配跨越被删除的段界（delBreak 合并的阅读行）：跳过', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'ab\ncd' });
+  ed.setTrackChanges(true);
+  // 删除 p0/p1 之间的换行：光标在第二段段首退格
+  ed.setSelection({ anchor: 3, head: 3 });
+  ed.handleBeforeInput({ inputType: 'deleteContentBackward', data: null, isComposing: false });
+  eq(exportText(ed.doc), 'abcd', '阅读视图两段合并为一行');
+  const r = findAll(ed.doc, 'bc');
+  eq(r.matches.length, 0);
+  eq(r.skipped.length, 1);
+  eq(r.skipped[0].reason, 'delete');
+});
+
+test('非修订模式全部替换：跨加粗 span、重复词、粗体对位继承，一笔事务', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'Tea and tea' });
+  // 把第一个 Tea 整体加粗
+  setBold(ed.doc, 0, 3, true);
+  ed.render();
+  const undoBefore = ed.undoStack.length;
+  const pv = ed.previewReplaceAll('Tea', 'COFFEE');
+  eq(pv.ok, true);
+  eq(pv.matches.length, 1, '区分大小写：只命中大写 Tea');
+  const res = ed.confirmReplaceAll();
+  eq(res.ok, true);
+  eq(res.applied, 1);
+  eq(docText(ed), 'COFFEE and tea', '小写 tea 未被替换');
+  // 粗体对位继承：原 Tea 全粗 -> COFFEE 全粗
+  eq(ed.doc.paragraphs[0].spans, [
+    span('COFFEE', { bold: true }), span(' and tea'),
+  ]);
+  eq(ed.undoStack.length, undoBefore + 1, '整批一笔撤销记录');
+  ed.undo();
+  eq(docText(ed), 'Tea and tea');
+  ed.redo();
+  eq(docText(ed), 'COFFEE and tea');
+  assertValid(ed);
+});
+
+test('全部替换重复词：多处一次完成，替换词不会再次成为命中', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'aa aa aa' });
+  const undoBefore = ed.undoStack.length;
+  const pv = ed.previewReplaceAll('aa', 'aaaa'); // 替换词含被查找词
+  eq(pv.matches.length, 3);
+  const res = ed.confirmReplaceAll();
+  eq(res.applied, 3);
+  eq(docText(ed), 'aaaa aaaa aaaa', '恰好替换原有 3 处，未级联替换新词');
+  eq(ed.undoStack.length, undoBefore + 1, '整批一笔撤销');
+  // 替换词更短也正确
+  const ed2 = newEditor();
+  ed2.paste({ text: 'xx-xx' });
+  ed2.previewReplaceAll('xx', 'y');
+  ed2.confirmReplaceAll();
+  eq(docText(ed2), 'y-y');
+});
+
+test('部分跳过时：命中照常替换，跳过项上报，修订身份不破坏', () => {
+  const ed = newEditor();
+  // 可见串含两个 'ab'：一个干净（段首）、一个由 'a' + 删除(z) + 'b' 构成
+  ed.paste({ text: 'ab azb' });
+  ed.setTrackChanges(true);
+  // 删除 'z'（偏移 4）：阅读视图里 'a' 'b' 拼成 'ab'
+  const delBefore = listRevisions(ed.doc);
+  eq(delBefore.length, 0);
+  ed.setSelection({ anchor: 4, head: 5 });
+  ed.deleteSelection();
+  const [delRev] = listRevisions(ed.doc);
+  eq(delRev.kind, 'delete');
+  const pv = ed.previewReplaceAll('ab', 'XY');
+  eq(pv.matches.length, 1, '仅干净的 ab 命中');
+  eq(pv.skipped.length, 1);
+  eq(pv.skipped[0].reason, 'delete');
+  const res = ed.confirmReplaceAll();
+  eq(res.applied, 1);
+  eq(res.skipped.length, 1);
+  eq(exportText(ed.doc), 'XY ab', '阅读视图：干净处替换，跳过处保持');
+  // 被跳过处原有的删除修订身份不变（同一条删除修订仍覆盖 z）
+  const delMarks = new Set();
+  for (const p of ed.doc.paragraphs) for (const s of p.spans) {
+    if (s.del != null && s.text === 'z') delMarks.add(s.del);
+  }
+  eq([...delMarks], [delRev.id], '跳过范围的既有删除修订身份未被改动');
+});
+
+test('修订模式全部替换：每处独立的删除+插入修订，可分别接受/拒绝', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'foo foo' });
+  ed.setTrackChanges(true);
+  const pv = ed.previewReplaceAll('foo', 'bar');
+  eq(pv.matches.length, 2);
+  const res = ed.confirmReplaceAll();
+  eq(res.applied, 2);
+  const revs = listRevisions(ed.doc);
+  eq(revs.length, 4, '2 删除 + 2 插入，身份各自独立');
+  eq(revs.map((r) => r.kind), ['delete', 'insert', 'delete', 'insert']);
+  const delIds = revs.filter((r) => r.kind === 'delete').map((r) => r.id);
+  const insIds = revs.filter((r) => r.kind === 'insert').map((r) => r.id);
+  ok(delIds[0] !== delIds[1] && insIds[0] !== insIds[1], '两处修订 id 互不相同');
+  eq(exportText(ed.doc), 'bar bar', '阅读视图只见新词');
+  eq(docText(ed), 'foobar foobar', '模型：旧词删除线保留、新词紧随');
+
+  // 接受第一处“删除”修订 = 接受第一处整组替换：旧词与其新词一并消失；
+  // 第二处尚未处理，阅读视图仍显示其新词。
+  ed.acceptRevision(delIds[0]);
+  eq(exportText(ed.doc), ' bar', '第一处整组消失；第二处新词仍显示');
+  eq(docText(ed), ' foobar', '模型中第二处旧词 foo 仍保留');
+  // 拒绝第二处的插入：新词移除、旧词仍处删除态
+  ed.rejectRevision(insIds[1]);
+  eq(exportText(ed.doc), ' ', '第二处新词被拒绝，旧词仍处删除态');
+  eq(ed.doc.paragraphs.length, 1, '段界不变');
+  // 再拒绝第二处的删除：旧词恢复
+  ed.rejectRevision(delIds[1]);
+  eq(exportText(ed.doc), ' foo');
+  assertValid(ed);
+  // 替换整批一笔事务 + 三次接受/拒绝各一笔；逐次撤销回到替换后，再回到原文
+  ed.undo();
+  eq(exportText(ed.doc), ' ');
+  ed.undo();
+  eq(exportText(ed.doc), ' bar');
+  ed.undo();
+  eq(exportText(ed.doc), 'bar bar');
+  ed.undo();
+  eq(docText(ed), 'foo foo');
+  eq(listRevisions(ed.doc).length, 0);
+});
+
+test('修订模式替换后：接受插入/拒绝删除的组合语义独立', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'abc' });
+  ed.setTrackChanges(true);
+  ed.previewReplaceAll('b', 'XY');
+  ed.confirmReplaceAll();
+  let revs = listRevisions(ed.doc);
+  const del = revs.find((r) => r.kind === 'delete');
+  const ins = revs.find((r) => r.kind === 'insert');
+  // 拒绝插入：新词移除，旧删除标记仍在
+  ed.rejectRevision(ins.id);
+  eq(exportText(ed.doc), 'ac');
+  // 拒绝删除：旧词恢复 -> 回到 abc
+  ed.rejectRevision(del.id);
+  eq(docText(ed), 'abc');
+  eq(exportText(ed.doc), 'abc');
+
+  // 另一路：接受插入（新词转正、delIns 绑定保留），再接受删除
+  // （旧词移除；新词已无 ins，不随 delIns 移除）= 最终替换
+  const ed2 = newEditor();
+  ed2.paste({ text: 'abc' });
+  ed2.setTrackChanges(true);
+  ed2.previewReplaceAll('b', 'XY');
+  ed2.confirmReplaceAll();
+  revs = listRevisions(ed2.doc);
+  const insId = revs.find((r) => r.kind === 'insert').id;
+  const delId = revs.find((r) => r.kind === 'delete').id;
+  ed2.acceptRevision(insId);
+  eq(exportText(ed2.doc), 'aXYc', '接受插入后新词仍可见');
+  ed2.acceptRevision(delId);
+  eq(docText(ed2), 'aXYc', '再接受删除：旧词移除，已转正的新词保留');
+  eq(listRevisions(ed2.doc).length, 0);
+});
+
+test('过期预览：文档变更或模式切换后确认被拒绝', () => {
+  const ed = newEditor();
+  type(ed, 'cat cat');
+  const pv = ed.previewReplaceAll('cat', 'dog');
+  eq(pv.ok, true);
+  // 文档改变（再打字）
+  type(ed, '!');
+  const stale = ed.confirmReplaceAll();
+  eq(stale.ok, false);
+  eq(stale.error, 'stale');
+  eq(docText(ed), 'cat cat!', '过期预览未执行任何替换');
+  // 过期预览仍挂着但不可用；取消后再确认报无预览
+  ed.cancelPreview();
+  eq(ed.confirmReplaceAll().error, 'no-preview');
+
+  // 重新预览后可以确认
+  ed.previewReplaceAll('cat', 'dog');
+  const ok2 = ed.confirmReplaceAll();
+  eq(ok2.ok, true);
+  eq(docText(ed), 'dog dog!');
+
+  // 模式切换同样使预览失效（确认时按 trackChanges 字段判 stale）
+  const ed3 = newEditor();
+  type(ed3, 'dog dog');
+  const pv3 = ed3.previewReplaceAll('dog', 'cat');
+  eq(pv3.trackChanges, false);
+  ed3.setTrackChanges(true); // 经正式 API 切换；预览对象保留但语义已过期
+  const stale3 = ed3.confirmReplaceAll();
+  eq(stale3.ok, false);
+  eq(stale3.error, 'stale');
+  eq(docText(ed3), 'dog dog', '模式切换未执行替换');
+
+  // 空查询不产生预览；无预览时确认被拒
+  const ed4 = newEditor();
+  eq(ed4.previewReplaceAll('', 'x').ok, false);
+  eq(ed4.confirmReplaceAll().ok, false);
+});
+
+test('撤销/重做后旧预览失效；替换后视图与导出一致', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'one one' });
+  ed.previewReplaceAll('one', 'two');
+  ed.confirmReplaceAll();
+  eq(docText(ed), 'two two');
+  ed.undo();
+  eq(docText(ed), 'one one');
+  // 撤销产生新版本，旧（已用）预览不可再确认
+  eq(ed.confirmReplaceAll().ok, false);
+  ed.redo();
+  eq(docText(ed), 'two two');
+  // 阅读视图 / 导出 / 修订表同源一致
+  eq(exportText(ed.doc), 'two two');
+  eq(exportHtml(ed.doc), '<p>two two</p>');
+  eq(listRevisions(ed.doc).length, 0);
+});
+
+test('替换后选区映射正确（模型偏移 <-> DOM）', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'aXbXc' });
+  ed.setSelection({ anchor: 5, head: 5 }); // 文档末尾
+  ed.previewReplaceAll('X', 'YY');
+  ed.confirmReplaceAll();
+  eq(docText(ed), 'aYYbYYc');
+  eq(ed.sel, { anchor: 7, head: 7 }, '末尾光标随长度增长平移');
+
+  // 光标落在被替换区间内 -> 折叠到该区间起点
+  const ed2 = newEditor();
+  ed2.paste({ text: 'abcde' });
+  ed2.setSelection({ anchor: 3, head: 3 }); // 'cd' 内部
+  ed2.previewReplaceAll('cd', 'XYZW');
+  ed2.confirmReplaceAll();
+  eq(ed2.sel, { anchor: 2, head: 2 }, '折叠到替换区间起点');
+  // 边界位置（区间起点）保持不动
+  const ed3 = newEditor();
+  ed3.paste({ text: 'aXb' });
+  ed3.setSelection({ anchor: 1, head: 1 }); // X 起点
+  ed3.previewReplaceAll('X', 'YY');
+  ed3.confirmReplaceAll();
+  eq(ed3.sel, { anchor: 1, head: 1 }, '区间边界位置保持在起点');
+
+  // DOM 往返
+  const root = renderToFake(ed.doc, ed.sel);
+  const pos = domPositionFromModelOffset(root, ed.sel.anchor);
+  eq(modelOffsetFromDomPosition(root, pos.node, pos.offset), ed.sel.anchor);
+});
+
+test('IME 组合期间：不提交替换、不丢失临时输入', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'aa aa' });
+  // 组合开始前先生成预览
+  const pv = ed.previewReplaceAll('aa', 'bb');
+  eq(pv.ok, true);
+  // 把光标移到文档末尾，组合输入追加在尾部
+  ed.setSelection({ anchor: 5, head: 5 });
+  ed.compositionStart();
+  // 组合期间预览与确认都被拒绝
+  eq(ed.previewReplaceAll('aa', 'bb').ok, false);
+  const res = ed.confirmReplaceAll();
+  eq(res.ok, false);
+  eq(res.error, 'composing');
+  eq(docText(ed), 'aa aa', '组合期间文档未被替换');
+  // 组合正常进行并提交（临时输入不丢）
+  ed.handleBeforeInput({ inputType: 'insertCompositionText', data: 'n', isComposing: true });
+  ed.handleBeforeInput({ inputType: 'insertCompositionText', data: 'ni', isComposing: true });
+  ed.compositionEnd('你');
+  ed.handleInput({ inputType: 'insertCompositionText', data: '你', isComposing: false });
+  eq(docText(ed), 'aa aa你', '组合输入完整保留在光标处');
+  // 组合已使旧预览过期，确认被拒；重新预览可执行
+  eq(ed.confirmReplaceAll().ok, false);
+  const pv2 = ed.previewReplaceAll('aa', 'bb');
+  eq(pv2.matches.length, 2);
+  const res2 = ed.confirmReplaceAll();
+  eq(res2.ok, true);
+  eq(docText(ed), 'bb bb你');
+});
+
+test('模型原语 replaceRangePlain / replaceRangeTracked 直接行为', () => {
+  // 替换段与右侧普通 o 粗体属性不同 -> 保留分段
+  const doc = buildDoc([['he', ['LL'], 'o']]); // heLLo，LL 粗
+  replaceRangePlain(doc, 2, 4, [{ text: 'yy', bold: true }]);
+  eq(doc.paragraphs[0].spans, [span('he'), span('yy', { bold: true }), span('o')]);
+  // 普通替换段与右侧普通 o 合并
+  const doc1 = buildDoc([['he', ['LL'], 'o']]);
+  replaceRangePlain(doc1, 2, 4, [{ text: 'yy', bold: false }]);
+  eq(doc1.paragraphs[0].spans, [span('heyyo')]);
+  const doc2 = buildDoc([['he', ['LL'], 'o']]);
+  replaceRangeTracked(doc2, 2, 4, [{ text: 'yy', bold: true }], 21, 22);
+  eq(doc2.paragraphs[0].spans, [
+    span('he'),
+    span('LL', { bold: true, del: 21 }),
+    // 新词带独立插入修订，并绑定删除修订（接受删除时随之移除）
+    span('yy', { bold: true, ins: 22, delIns: 21 }),
+    span('o'),
+  ]);
+  // 修订表中新词只计入插入修订，删除修订只含旧词
+  eq(listRevisions(doc2), [
+    { id: 21, kind: 'delete', text: 'LL', paragraphs: [0] },
+    { id: 22, kind: 'insert', text: 'yy', paragraphs: [0] },
+  ]);
+  // 跨段调用不改动文档
+  const doc3 = buildDoc([['ab'], ['cd']]);
+  const before = JSON.stringify(doc3);
+  replaceRangePlain(doc3, 1, 4, [{ text: 'z', bold: false }]);
+  eq(JSON.stringify(doc3), before);
+});
+
+test('邻处接受/拒绝不影响彼此格式与段界（三处替换中间处单独操作）', () => {
+  const ed = newEditor();
+  ed.paste({ text: 'x-a-x-b-x' });
+  // 把 'a'、'b' 加粗，验证格式隔离
+  setBold(ed.doc, 2, 3, true);
+  setBold(ed.doc, 6, 7, true);
+  ed.render();
+  ed.setTrackChanges(true);
+  ed.previewReplaceAll('x', 'Q');
+  ed.confirmReplaceAll();
+  eq(exportText(ed.doc), 'Q-a-Q-b-Q');
+  const revs = listRevisions(ed.doc);
+  // 只拒绝中间一处的插入修订（第二处 Q）
+  const insMid = revs.filter((r) => r.kind === 'insert')[1];
+  ed.rejectRevision(insMid.id);
+  eq(exportText(ed.doc), 'Q-a--b-Q', '中间新插入被拒，阅读视图恢复旧 x');
+  // 加粗的 a/b 仍粗，段数不变
+  const p0 = ed.doc.paragraphs[0];
+  const boldTexts = p0.spans.filter((s) => s.bold).map((s) => s.text);
+  ok(boldTexts.includes('a') && boldTexts.includes('b'), '相邻加粗格式保留');
+  eq(ed.doc.paragraphs.length, 1);
+  assertValid(ed);
+});
+
+test('Unicode 代理对：命中坐标与替换均按 UTF-16 码元，不错位', () => {
+  const ed = newEditor();
+  ed.paste({ text: '😀a😀' });
+  const pv = ed.previewReplaceAll('😀', 'B');
+  eq(pv.matches.length, 2);
+  eq(pv.matches.map((m) => [m.from, m.to]), [[0, 2], [3, 5]]);
+  ed.confirmReplaceAll();
+  eq(docText(ed), 'BaB');
+  // emoji 作为替换词也按码元落位
+  const ed2 = newEditor();
+  ed2.paste({ text: 'x-x' });
+  ed2.previewReplaceAll('x', '😀');
+  ed2.confirmReplaceAll();
+  eq(docText(ed2), '😀-😀');
 });
 
 // ---------- 汇总 ----------

@@ -5,12 +5,26 @@ import {
   createDoc, cloneDoc, textLength, insertTextInto, deleteRange, markDeleted,
   splitParagraph, insertParagraphs, setBold, allBold, insertionAttrs,
   acceptRevision, rejectRevision, mapThroughRemovals,
+  replaceRangePlain, replaceRangeTracked,
 } from './model.js';
 import { listRevisions } from './derive.js';
 import { sanitizeHtml, textToParagraphs } from './sanitize.js';
+import { findAll, segmentsFor } from './find.js';
 
 const collapsed = (o) => ({ anchor: o, head: o });
 const rangeOf = (sel) => [Math.min(sel.anchor, sel.head), Math.max(sel.anchor, sel.head)];
+
+// 把旧坐标系偏移映射到一批“从右向左应用的同段替换”之后的新坐标系。
+// edits 按应用顺序（from 降序）排列；落在被替换区间内的偏移折叠到区间起点。
+function mapThroughReplacements(offset, edits) {
+  let result = offset;
+  for (const e of edits) { // 右 -> 左：每次调整都发生在当前已处理部分之外
+    const delta = e.len - (e.to - e.from);
+    if (result >= e.to) result += delta;
+    else if (result > e.from) result = e.from;
+  }
+  return result;
+}
 
 export class Editor {
   // view: { render(state) }。state 见 getState()。
@@ -26,6 +40,8 @@ export class Editor {
     this.composing = null;      // { sel } 组合会话
     this._mergeType = null;     // 'insert' | 'delete' | null：可合并的连续输入
     this._runRevId = null;      // 当前输入合并段使用的修订 id
+    this.docVersion = 0;        // 每次文档变更自增；用于使旧预览失效
+    this.preview = null;        // 绑定到 docVersion 的“全部替换”预览
     this.onrender = null;
   }
 
@@ -40,6 +56,8 @@ export class Editor {
       revisions: listRevisions(this.doc),
       canUndo: this.undoStack.length > 0,
       canRedo: this.redoStack.length > 0,
+      docVersion: this.docVersion,
+      composing: this.composing != null,
     };
   }
 
@@ -79,6 +97,8 @@ export class Editor {
     if (mergeType !== 'insert' && mergeType !== 'delete') this._runRevId = null;
     this.redoStack.length = 0;
     this.doc = doc;
+    this.docVersion++;
+    // 不清空 preview：旧预览保留，确认时按 version 判其过期（stale）。
     this.sel = { anchor: this._clampOffset(sel.anchor), head: this._clampOffset(sel.head) };
     this.render();
   }
@@ -88,6 +108,8 @@ export class Editor {
     if (!s) return;
     this.redoStack.push({ doc: this.doc, sel: this.sel });
     this.doc = s.doc;
+    this.docVersion++;
+    // 预览保留；版本不再匹配，确认时报告 stale。
     this.sel = { anchor: this._clampOffset(s.sel.anchor), head: this._clampOffset(s.sel.head) };
     this._mergeType = null;
     this._runRevId = null;
@@ -99,6 +121,8 @@ export class Editor {
     if (!s) return;
     this.undoStack.push({ doc: this.doc, sel: this.sel });
     this.doc = s.doc;
+    this.docVersion++;
+    // 预览保留；版本不再匹配，确认时报告 stale。
     this.sel = { anchor: this._clampOffset(s.sel.anchor), head: this._clampOffset(s.sel.head) };
     this._mergeType = null;
     this._runRevId = null;
@@ -192,6 +216,7 @@ export class Editor {
     this.trackChanges = !!on;
     this._mergeType = null;
     this._runRevId = null;
+    // 不清空 preview：confirmReplaceAll 会用 trackChanges 字段判其过期（stale）。
     this.render();
   }
 
@@ -256,6 +281,97 @@ export class Editor {
       };
     }
     this._commit(doc, sel, null);
+  }
+
+  // ---- 查找并全部替换 ------------------------------------------------------
+  //
+  // 流程：previewReplaceAll 按当前阅读视图可见文字计算命中并生成**绑定到
+  // docVersion 的预览**；confirmReplaceAll 执行时若文档已变更（版本不符）或
+  // 修订模式被切换，则拒绝旧预览。整批替换只提交一笔事务（一次撤销/重做）。
+  // 从右向左逐处应用，先分配修订 id 再执行，因此新插入的词不会再次成为
+  // 本批命中；修订模式下每处产生“删除 + 插入”两条相互独立的修订身份。
+
+  // 生成预览。组合期间拒绝（避免与浏览器临时 DOM 冲突）。
+  // 返回 { ok, query, replacement, matches, skipped, version, trackChanges }
+  // 或 { ok:false, error }。
+  previewReplaceAll(query, replacement) {
+    if (this.composing) return { ok: false, error: 'composing' };
+    query = String(query ?? '');
+    replacement = String(replacement ?? '');
+    if (!query) {
+      this.preview = null;
+      return { ok: false, error: 'empty-query' };
+    }
+    const found = findAll(this.doc, query);
+    // 为每处命中预算替换段（粗体按命中字符对位继承，多余字符沿用末位粗体）。
+    const matches = found.matches.map((m) => ({
+      ...m,
+      replacement,
+      segments: segmentsFor(replacement, m.bolds),
+    }));
+    this.preview = {
+      query,
+      replacement,
+      matches,
+      skipped: found.skipped,
+      version: this.docVersion,
+      trackChanges: this.trackChanges,
+    };
+    return {
+      ok: true,
+      query,
+      replacement,
+      matches,
+      skipped: found.skipped,
+      version: this.docVersion,
+      trackChanges: this.trackChanges,
+    };
+  }
+
+  cancelPreview() {
+    this.preview = null;
+  }
+
+  // 确认预览。返回 { ok, applied, skipped } 或 { ok:false, error }。
+  confirmReplaceAll() {
+    if (this.composing) return { ok: false, error: 'composing' };
+    const pv = this.preview;
+    if (!pv) return { ok: false, error: 'no-preview' };
+    if (pv.version !== this.docVersion) return { ok: false, error: 'stale' };
+    if (pv.trackChanges !== this.trackChanges) return { ok: false, error: 'stale' };
+    if (!pv.matches.length) {
+      this.preview = null;
+      return { ok: true, applied: 0, skipped: pv.skipped };
+    }
+
+    // 从右向左应用：右侧替换产生的位移不影响左侧命中的原始坐标；
+    // 新插入的词因此也不可能再次进入本批匹配。
+    const ordered = [...pv.matches].sort((a, b) => b.from - a.from);
+    // 先按从左到右顺序分配修订 id（修订表按 id 升序，id 顺序即文档顺序）。
+    const revByIdx = pv.matches.map(() => ({
+      del: this.trackChanges ? this._newRev() : null,
+      ins: this.trackChanges ? this._newRev() : null,
+    }));
+
+    const doc = cloneDoc(this.doc);
+    const edits = []; // { from, to, len } 实际应用序列（从右向左）
+    for (const m of ordered) {
+      const ids = revByIdx[m.index];
+      if (this.trackChanges) {
+        replaceRangeTracked(doc, m.from, m.to, m.segments, ids.del, ids.ins);
+      } else {
+        replaceRangePlain(doc, m.from, m.to, m.segments);
+      }
+      edits.push({ from: m.from, to: m.to, len: m.replacement.length });
+    }
+
+    const mapOffset = (o) => mapThroughReplacements(o, edits);
+    const sel = { anchor: mapOffset(this.sel.anchor), head: mapOffset(this.sel.head) };
+    const applied = pv.matches.length;
+    const skipped = pv.skipped;
+    this.preview = null;      // 成功消费预览
+    this._commit(doc, sel, null); // 整批一笔事务
+    return { ok: true, applied, skipped };
   }
 
   // ---- 输入法组合（IME） -----------------------------------------------------

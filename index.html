@@ -60,6 +60,15 @@
     <label><input type="checkbox" id="chk-track"> 修订模式</label>
     <button id="btn-accept-all">接受全部</button>
     <button id="btn-reject-all">拒绝全部</button>
+    <span style="flex-basis:100%; height:0"></span>
+    <input id="find-text" type="text" placeholder="查找词（区分大小写）"
+           style="width:180px; padding:4px 8px; border:1px solid #c9ced6; border-radius:6px; font-size:14px;">
+    <input id="replace-text" type="text" placeholder="替换为"
+           style="width:180px; padding:4px 8px; border:1px solid #c9ced6; border-radius:6px; font-size:14px;">
+    <button id="btn-preview">预览全部替换</button>
+    <button id="btn-confirm" disabled>确认替换</button>
+    <button id="btn-cancel" disabled>取消</button>
+    <span id="find-status" style="font-size:13px; color:#6b7280;"></span>
   </div>
 </header>
 <main>

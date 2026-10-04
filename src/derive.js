@@ -1,6 +1,7 @@
 // 从同一文档模型派生的只读视图：阅读视图、修订表、导出。
 
-// 阅读视图：插入视为普通文字，删除隐藏，被删换行合并段落。
+// 阅读视图：插入视为普通文字（含带 delIns 绑定的替换新词），
+// 纯删除内容隐藏，被删换行合并段落。
 // 返回 [{ spans: [{ text, bold }] }]。
 export function finalParagraphs(doc) {
   const out = [];
@@ -8,7 +9,7 @@ export function finalParagraphs(doc) {
   for (const p of doc.paragraphs) {
     const spans = [];
     for (const s of p.spans) {
-      if (s.del != null || !s.text) continue;
+      if (s.del != null || !s.text) continue; // 纯删除隐藏；ins/delIns 的新词保留
       const last = spans[spans.length - 1];
       if (last && last.bold === s.bold) last.text += s.text;
       else spans.push({ text: s.text, bold: s.bold });
@@ -52,6 +53,8 @@ export function exportText(doc) {
 
 // 修订表：扫描模型中的 ins/del/delBreak 标记，按修订 id 归组。
 // 返回 [{ id, kind: 'insert'|'delete', text, paragraphs: [paraIndex] }]。
+// 替换新词 span 带 ins（计入插入修订）与 delIns（不单独计数，仅记录其
+// 随哪个删除修订移除），因此每处替换恰为“一条删除 + 一条插入”。
 export function listRevisions(doc) {
   const map = new Map();
   const add = (id, kind, text, para) => {
@@ -68,7 +71,7 @@ export function listRevisions(doc) {
     if (p.ins != null) add(p.ins, 'insert', '¶', pi);
     for (const s of p.spans) {
       if (s.ins != null) add(s.ins, 'insert', s.text, pi);
-      if (s.del != null) add(s.del, 'delete', s.text, pi);
+      else if (s.del != null) add(s.del, 'delete', s.text, pi);
     }
     if (p.delBreak != null) add(p.delBreak, 'delete', '¶', pi);
   });

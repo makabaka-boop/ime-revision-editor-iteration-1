@@ -129,12 +129,12 @@ export class DomView {
           el = w;
         }
         if (s.ins != null) {
+          // ins span（含带 delIns 绑定的替换新词）：绿色下划线，无删除线
           const w = document.createElement('span');
           w.className = 'rev-ins';
           w.appendChild(el);
           el = w;
-        }
-        if (s.del != null) {
+        } else if (s.del != null) {
           const w = document.createElement('del');
           w.className = 'rev-del';
           w.appendChild(el);
