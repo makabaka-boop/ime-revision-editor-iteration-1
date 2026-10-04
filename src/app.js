@@ -14,6 +14,11 @@ const btnBold = document.getElementById('btn-bold');
 const chkTrack = document.getElementById('chk-track');
 const btnAcceptAll = document.getElementById('btn-accept-all');
 const btnRejectAll = document.getElementById('btn-reject-all');
+const findInput = document.getElementById('find-input');
+const replaceInput = document.getElementById('replace-input');
+const btnPreviewReplace = document.getElementById('btn-preview-replace');
+const btnReplaceAll = document.getElementById('btn-replace-all');
+const replaceStatus = document.getElementById('replace-status');
 
 let syncingSelection = false;
 
@@ -81,6 +86,59 @@ chkTrack.addEventListener('change', () => ed.setTrackChanges(chkTrack.checked));
 btnAcceptAll.addEventListener('click', () => ed.acceptAll());
 btnRejectAll.addEventListener('click', () => ed.rejectAll());
 
+// ---- 查找并全部替换 ----
+// 预览绑定文档版本号；任何文档变更（含撤销/重做）都会使旧预览失效。
+// IME 组合期间控制器拒绝预览与执行，这里同步禁用按钮。
+
+let pendingPreview = null;
+
+function syncReplaceAllButton() {
+  btnReplaceAll.disabled =
+    !pendingPreview || pendingPreview.version !== ed.docVersion || !!ed.composing;
+}
+
+btnPreviewReplace.addEventListener('click', () => {
+  const p = ed.previewReplaceAll(findInput.value, replaceInput.value);
+  if (!p) {
+    pendingPreview = null;
+    replaceStatus.textContent = ed.composing ? '输入法组合中，稍后再试' : '请输入查找内容';
+  } else {
+    pendingPreview = p;
+    replaceStatus.textContent =
+      `命中 ${p.matches.length} 处` +
+      (p.skipped.length ? `，${p.skipped.length} 处含未决修订已跳过` : '');
+  }
+  syncReplaceAllButton();
+});
+
+btnReplaceAll.addEventListener('click', () => {
+  const r = ed.applyReplaceAll(pendingPreview);
+  if (!r) {
+    replaceStatus.textContent = '文档已变更，预览过期，请重新预览';
+  } else {
+    pendingPreview = null;
+    replaceStatus.textContent =
+      `已替换 ${r.applied} 处` + (r.skipped ? `，跳过 ${r.skipped} 处` : '');
+  }
+  syncReplaceAllButton();
+});
+
+// 查找/替换词一变，旧预览即失效
+for (const input of [findInput, replaceInput]) {
+  input.addEventListener('input', () => {
+    pendingPreview = null;
+    replaceStatus.textContent = '';
+    syncReplaceAllButton();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') btnPreviewReplace.click();
+  });
+}
+
+// 组合开始/结束时刷新按钮可用性（组合期间禁止提交替换）
+editorEl.addEventListener('compositionstart', () => syncReplaceAllButton());
+editorEl.addEventListener('compositionend', () => syncReplaceAllButton());
+
 // ---- 面板（阅读视图 / 修订表 / 导出，均从同一模型派生） ----
 
 function renderPanels(state) {
@@ -114,7 +172,7 @@ function renderPanels(state) {
     const li = document.createElement('li');
     const badge = document.createElement('span');
     badge.className = `badge ${r.kind}`;
-    badge.textContent = r.kind === 'insert' ? '插入' : '删除';
+    badge.textContent = r.kind === 'insert' ? '插入' : r.kind === 'delete' ? '删除' : '替换';
     const preview = document.createElement('span');
     preview.className = 'preview';
     const text = r.text.length > 24 ? r.text.slice(0, 24) + '…' : r.text;
@@ -134,6 +192,7 @@ function renderPanels(state) {
   btnRedo.disabled = !state.canRedo;
   btnBold.classList.toggle('active', state.typingBold);
   chkTrack.checked = state.trackChanges;
+  syncReplaceAllButton(); // 文档版本可能已变，旧预览随之失效
 }
 
 ed.onrender = renderPanels;

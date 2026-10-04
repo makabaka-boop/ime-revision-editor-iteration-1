@@ -51,17 +51,20 @@ export function exportText(doc) {
 }
 
 // 修订表：扫描模型中的 ins/del/delBreak 标记，按修订 id 归组。
-// 返回 [{ id, kind: 'insert'|'delete', text, paragraphs: [paraIndex] }]。
+// 同一 id 同时带有删除与插入（替换全部产生的一对）时 kind 为 'replace'，
+// text 形如 “旧→新”。
+// 返回 [{ id, kind: 'insert'|'delete'|'replace', text, paragraphs: [paraIndex] }]。
 export function listRevisions(doc) {
   const map = new Map();
   const add = (id, kind, text, para) => {
     if (id == null) return;
     let r = map.get(id);
     if (!r) {
-      r = { id, kind, text: '', paragraphs: new Set() };
+      r = { id, insText: '', delText: '', paragraphs: new Set() };
       map.set(id, r);
     }
-    r.text += text;
+    if (kind === 'insert') r.insText += text;
+    else r.delText += text;
     r.paragraphs.add(para);
   };
   doc.paragraphs.forEach((p, pi) => {
@@ -74,5 +77,13 @@ export function listRevisions(doc) {
   });
   return [...map.values()]
     .sort((a, b) => a.id - b.id)
-    .map((r) => ({ id: r.id, kind: r.kind, text: r.text, paragraphs: [...r.paragraphs] }));
+    .map((r) => {
+      const both = r.insText !== '' && r.delText !== '';
+      return {
+        id: r.id,
+        kind: both ? 'replace' : r.insText !== '' ? 'insert' : 'delete',
+        text: both ? `${r.delText}→${r.insText}` : r.insText !== '' ? r.insText : r.delText,
+        paragraphs: [...r.paragraphs],
+      };
+    });
 }

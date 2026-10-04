@@ -8,9 +8,17 @@ import {
 } from './model.js';
 import { listRevisions } from './derive.js';
 import { sanitizeHtml, textToParagraphs } from './sanitize.js';
+import { findAll, boldAt } from './find.js';
 
 const collapsed = (o) => ({ anchor: o, head: o });
 const rangeOf = (sel) => [Math.min(sel.anchor, sel.head), Math.max(sel.anchor, sel.head)];
+
+// 选区映射：修订替换在 p 处插入 len 个字符（被删文字保留在模型中）。
+const mapInsertAt = (o, p, len) => (o >= p ? o + len : o);
+// 选区映射：直接替换把 [from, to) 换成 len 个字符；
+// 落在被删区内的偏移折叠到替换文本末尾。
+const mapSubstituteAt = (o, from, to, len) =>
+  o <= from ? o : o >= to ? o - (to - from) + len : from + len;
 
 export class Editor {
   // view: { render(state) }。state 见 getState()。
@@ -26,6 +34,7 @@ export class Editor {
     this.composing = null;      // { sel } 组合会话
     this._mergeType = null;     // 'insert' | 'delete' | null：可合并的连续输入
     this._runRevId = null;      // 当前输入合并段使用的修订 id
+    this.docVersion = 0;        // 文档版本号：每次变更递增，用于绑定替换预览
     this.onrender = null;
   }
 
@@ -40,6 +49,7 @@ export class Editor {
       revisions: listRevisions(this.doc),
       canUndo: this.undoStack.length > 0,
       canRedo: this.redoStack.length > 0,
+      docVersion: this.docVersion,
     };
   }
 
@@ -79,6 +89,7 @@ export class Editor {
     if (mergeType !== 'insert' && mergeType !== 'delete') this._runRevId = null;
     this.redoStack.length = 0;
     this.doc = doc;
+    this.docVersion++;
     this.sel = { anchor: this._clampOffset(sel.anchor), head: this._clampOffset(sel.head) };
     this.render();
   }
@@ -88,6 +99,7 @@ export class Editor {
     if (!s) return;
     this.redoStack.push({ doc: this.doc, sel: this.sel });
     this.doc = s.doc;
+    this.docVersion++;
     this.sel = { anchor: this._clampOffset(s.sel.anchor), head: this._clampOffset(s.sel.head) };
     this._mergeType = null;
     this._runRevId = null;
@@ -99,6 +111,7 @@ export class Editor {
     if (!s) return;
     this.undoStack.push({ doc: this.doc, sel: this.sel });
     this.doc = s.doc;
+    this.docVersion++;
     this.sel = { anchor: this._clampOffset(s.sel.anchor), head: this._clampOffset(s.sel.head) };
     this._mergeType = null;
     this._runRevId = null;
@@ -256,6 +269,58 @@ export class Editor {
       };
     }
     this._commit(doc, sel, null);
+  }
+
+  // ---- 查找并全部替换 ------------------------------------------------------
+  // 预览绑定当前文档版本号；确认时版本不符（文档已变更）或正在 IME 组合，
+  // 一律拒绝执行——既不会提交替换，也不会重渲染弄丢组合中的临时输入。
+
+  previewReplaceAll(find, replace) {
+    if (this.composing || !find) return null;
+    const { matches, skipped } = findAll(this.doc, find);
+    return {
+      version: this.docVersion,
+      find,
+      replace: String(replace ?? '').replace(/[\r\n]+/g, ''), // 替换词不含换行
+      matches,   // 干净命中（模型偏移，升序）
+      skipped,   // 含未决修订而被跳过的命中（报告用）
+    };
+  }
+
+  applyReplaceAll(preview) {
+    if (!preview || this.composing) return null;
+    if (preview.version !== this.docVersion) return null; // 过期预览
+    const matches = preview.matches || [];
+    const skipped = (preview.skipped || []).length;
+    if (!matches.length) return { applied: 0, skipped }; // 无可应用项：不产生事务
+    const replace = String(preview.replace ?? '').replace(/[\r\n]+/g, '');
+    const doc = cloneDoc(this.doc);
+    let sel = { ...this.sel };
+    // 命中在预览时一次性算好，从后往前应用：前面的命中偏移不受后面改动影响，
+    // 新插入的词也不会再次成为本批命中。
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const { from, to } = matches[i];
+      const bold = boldAt(doc, from); // 替换词继承被替换文字首字符的格式
+      if (this.trackChanges) {
+        // 每处命中一个独立修订 id：相配的删除 + 插入，可在修订表中单独接受/拒绝
+        const revId = this._newRev();
+        markDeleted(doc, from, to, revId);
+        if (replace) insertTextInto(doc, to, replace, { bold, ins: revId });
+        sel = {
+          anchor: mapInsertAt(sel.anchor, to, replace.length),
+          head: mapInsertAt(sel.head, to, replace.length),
+        };
+      } else {
+        deleteRange(doc, from, to);
+        if (replace) insertTextInto(doc, from, replace, { bold });
+        sel = {
+          anchor: mapSubstituteAt(sel.anchor, from, to, replace.length),
+          head: mapSubstituteAt(sel.head, from, to, replace.length),
+        };
+      }
+    }
+    this._commit(doc, sel, null); // 整批只占一条撤销记录
+    return { applied: matches.length, skipped };
   }
 
   // ---- 输入法组合（IME） -----------------------------------------------------

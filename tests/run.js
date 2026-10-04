@@ -837,6 +837,255 @@ test('拆段/并段后 DOM 映射仍指向正确字符', () => {
   eq(modelOffsetFromDomPosition(root2, pos2.node, pos2.offset), 2);
 });
 
+// ---------- 控制器：查找并全部替换 ----------
+
+test('查找预览：重复词、区分大小写、非重叠；新插入的词不再成为本批命中', () => {
+  const ed = newEditor();
+  type(ed, 'Foo foo foo');
+  const p = ed.previewReplaceAll('foo', 'foofoo');
+  eq(p.matches.length, 2, '区分大小写，只命中两个小写 foo');
+  eq(p.skipped.length, 0);
+  eq(ed.applyReplaceAll(p).applied, 2);
+  eq(docText(ed), 'Foo foofoo foofoo', '插入的 foo 不会被本批再次命中');
+  // 非重叠：'aaa' 中 'aa' 只命中一次
+  const ed2 = newEditor();
+  type(ed2, 'aaa');
+  const p2 = ed2.previewReplaceAll('aa', 'b');
+  eq(p2.matches.length, 1);
+  ed2.applyReplaceAll(p2);
+  eq(docText(ed2), 'ba');
+  assertValid(ed);
+  assertValid(ed2);
+});
+
+test('命中可跨越加粗 span；拒绝恢复原格式、接受后新词为普通文字', () => {
+  const ed = newEditor();
+  type(ed, '错词');
+  ed.setSelection({ anchor: 1, head: 2 });
+  ed.toggleBold(); // '词' 加粗
+  ed.setSelection({ anchor: 2, head: 2 });
+  ed.setTrackChanges(true);
+  const p = ed.previewReplaceAll('错词', '对词');
+  eq(p.matches.length, 1, '命中跨越加粗 span');
+  ed.applyReplaceAll(p);
+  eq(exportText(ed.doc), '对词');
+  const [rev] = listRevisions(ed.doc);
+  eq(rev.kind, 'replace');
+  eq(rev.text, '错词→对词');
+  // 拒绝：恢复原文字与加粗格式
+  ed.rejectRevision(rev.id);
+  eq(docText(ed), '错词');
+  eq(ed.doc.paragraphs[0].spans, [span('错'), span('词', { bold: true })], '拒绝恢复原格式');
+  // 重新替换并接受：新词成为普通文字
+  const p2 = ed.previewReplaceAll('错词', '对词');
+  ed.applyReplaceAll(p2);
+  const [rev2] = listRevisions(ed.doc);
+  ed.acceptRevision(rev2.id);
+  eq(docText(ed), '对词');
+  eq(ed.doc.paragraphs[0].spans, [span('对词')], '接受后新词为普通文字');
+  assertValid(ed);
+});
+
+test('匹配不跨段落', () => {
+  const ed = newEditor();
+  ed.paste({ text: '错\n词' });
+  const p = ed.previewReplaceAll('错词', '对词');
+  eq(p.matches.length, 0, '换行两侧的文字不构成命中');
+  eq(p.skipped.length, 0);
+  const ed2 = newEditor();
+  ed2.paste({ text: '错词\n错词' });
+  const p2 = ed2.previewReplaceAll('错词', '对词');
+  eq(p2.matches.length, 2, '每段各自命中');
+  ed2.applyReplaceAll(p2);
+  eq(docText(ed2), '对词\n对词');
+  eq(ed2.doc.paragraphs.length, 2, '段界不变');
+});
+
+test('含未决修订的命中被跳过并报告，已有修订身份不变', () => {
+  const ed = newEditor();
+  type(ed, '错词。');
+  ed.setTrackChanges(true);
+  type(ed, '错词'); // 未决插入（修订 1）
+  ed.setTrackChanges(false);
+  pressEnter(ed);
+  type(ed, '甲A乙');
+  ed.setTrackChanges(true);
+  ed.setSelection({ anchor: 7, head: 8 }); // 选中 'A'
+  ed.deleteSelection(); // 未决删除（修订 2）：可见文字变成 '甲乙'
+  ed.setTrackChanges(false);
+  eq(docText(ed), '错词。错词\n甲A乙');
+
+  // 命中未决插入 -> 跳过并报告
+  const p1 = ed.previewReplaceAll('错词', '对词');
+  eq(p1.matches, [{ from: 0, to: 2 }], '只有干净的命中可替换');
+  eq(p1.skipped.length, 1, '未决插入处的命中被跳过并报告');
+  // 可见 命中夹着被删文字 -> 跳过并报告
+  const p2 = ed.previewReplaceAll('甲乙', '丙');
+  eq(p2.matches.length, 0);
+  eq(p2.skipped.length, 1, '夹着未决删除的命中被跳过并报告');
+
+  const undoBefore = ed.undoStack.length;
+  eq(ed.applyReplaceAll(p2), { applied: 0, skipped: 1 });
+  eq(ed.undoStack.length, undoBefore, '没有可应用项时不产生撤销记录');
+  eq(docText(ed), '错词。错词\n甲A乙', '没有可应用项时文档不变');
+
+  const idsBefore = listRevisions(ed.doc).map((r) => r.id);
+  eq(ed.applyReplaceAll(p1).applied, 1); // p2 的预览/空应用不改变文档，p1 仍有效
+  eq(docText(ed), '对词。错词\n甲A乙');
+  eq(exportText(ed.doc), '对词。错词\n甲乙');
+  eq(listRevisions(ed.doc).map((r) => r.id), idsBefore, '已有修订身份不变');
+  // 已有的未决修订仍可独立接受
+  ed.acceptRevision(idsBefore[0]);
+  eq(listRevisions(ed.doc).map((r) => r.id), [idsBefore[1]]);
+  eq(docText(ed), '对词。错词\n甲A乙');
+  assertValid(ed);
+});
+
+test('预览绑定文档版本：文档变更或撤销/重做后旧预览被拒绝', () => {
+  // 仅切换修订模式不改变文档，预览仍然有效，且按当前模式记录修订
+  const ed = newEditor();
+  type(ed, '错词');
+  const p = ed.previewReplaceAll('错词', '对词');
+  ed.setTrackChanges(true);
+  eq(ed.applyReplaceAll(p).applied, 1);
+  eq(listRevisions(ed.doc)[0].kind, 'replace');
+
+  // 普通编辑使预览过期
+  const ed2 = newEditor();
+  type(ed2, '错词');
+  const p2 = ed2.previewReplaceAll('错词', '对词');
+  type(ed2, '甲');
+  eq(ed2.applyReplaceAll(p2), null, '文档变更后旧预览被拒绝');
+  eq(docText(ed2), '错词甲');
+
+  // 撤销/重做也使预览过期
+  const ed3 = newEditor();
+  type(ed3, '错词');
+  const p3 = ed3.previewReplaceAll('错词', '对词');
+  ed3.undo();
+  eq(ed3.applyReplaceAll(p3), null, '撤销后旧预览被拒绝');
+  ed3.redo();
+  eq(ed3.applyReplaceAll(p3), null, '重做后旧预览仍过期');
+  const p4 = ed3.previewReplaceAll('错词', '对词');
+  eq(ed3.applyReplaceAll(p4).applied, 1);
+  eq(docText(ed3), '对词');
+  assertValid(ed3);
+});
+
+test('修订模式：每处命中记为一对独立删除+插入修订，整批一笔撤销', () => {
+  const ed = newEditor();
+  type(ed, '错词和错词');
+  ed.setTrackChanges(true);
+  const before = ed.undoStack.length;
+  const p = ed.previewReplaceAll('错词', '对词');
+  eq(p.matches.length, 2);
+  eq(ed.applyReplaceAll(p).applied, 2);
+  eq(ed.undoStack.length, before + 1, '整批只占一条撤销记录');
+  eq(docText(ed), '错词对词和错词对词', '模型保留被删文字');
+  eq(exportText(ed.doc), '对词和对词', '阅读视图为替换后的样子');
+  const revs = listRevisions(ed.doc);
+  eq(revs.length, 2, '每处命中一条独立修订');
+  ok(revs.every((r) => r.kind === 'replace' && r.text === '错词→对词'));
+  ed.undo();
+  eq(docText(ed), '错词和错词');
+  eq(listRevisions(ed.doc).length, 0);
+  ed.redo();
+  eq(exportText(ed.doc), '对词和对词');
+  eq(listRevisions(ed.doc).length, 2);
+  assertValid(ed);
+});
+
+test('每处替换可独立接受/拒绝，不影响邻处格式与段界', () => {
+  const ed = newEditor();
+  ed.paste({ text: '错词甲\n错词乙\n错词丙' });
+  ed.setTrackChanges(true);
+  const p = ed.previewReplaceAll('错词', '对词');
+  eq(p.matches.length, 3);
+  ed.applyReplaceAll(p);
+  eq(ed.doc.paragraphs.length, 3);
+  const revs = listRevisions(ed.doc);
+  eq(revs.length, 3);
+  ok(revs.every((r) => r.kind === 'replace'));
+  // 接受中间一处（第二段）
+  ed.acceptRevision(revs[1].id);
+  eq(ed.doc.paragraphs.length, 3, '段界不变');
+  eq(docText(ed), '错词对词甲\n对词乙\n错词对词丙');
+  eq(exportText(ed.doc), '对词甲\n对词乙\n对词丙');
+  // 拒绝最后一处（第三段）
+  ed.rejectRevision(revs[0].id);
+  eq(docText(ed), '错词对词甲\n对词乙\n错词丙');
+  eq(ed.doc.paragraphs.length, 3, '段界仍不变');
+  eq(listRevisions(ed.doc).map((r) => r.id), [revs[2].id], '只剩第一处的修订');
+  assertValid(ed);
+});
+
+test('非修订模式直接替换；空查找词拒绝，空替换词等价于删除', () => {
+  const ed = newEditor();
+  type(ed, '错词错词');
+  const p = ed.previewReplaceAll('错词', '对');
+  eq(ed.applyReplaceAll(p).applied, 2);
+  eq(docText(ed), '对对');
+  eq(listRevisions(ed.doc).length, 0, '非修订模式不产生修订');
+  ed.undo();
+  eq(docText(ed), '错词错词');
+  ed.redo();
+  eq(docText(ed), '对对');
+
+  eq(ed.previewReplaceAll('', 'x'), null, '空查找词返回 null');
+  const ed2 = newEditor();
+  type(ed2, '错词');
+  const p2 = ed2.previewReplaceAll('错词', '');
+  eq(ed2.applyReplaceAll(p2).applied, 1);
+  eq(docText(ed2), '', '空替换词等价于删除');
+  assertValid(ed2);
+});
+
+test('替换后模型偏移、DOM 选区、阅读视图、修订列表与导出一致', () => {
+  const ed = newEditor();
+  type(ed, '甲错词乙错词丙');
+  ed.setSelection({ anchor: 9, head: 9 }); // 越界，收敛到末尾 7
+  ed.setTrackChanges(true);
+  const p = ed.previewReplaceAll('错词', '对错词');
+  ed.applyReplaceAll(p);
+  eq(docText(ed), '甲错词对错词乙错词对错词丙');
+  eq(exportText(ed.doc), '甲对错词乙对错词丙', '阅读视图一致');
+  eq(exportHtml(ed.doc), '<p>甲对错词乙对错词丙</p>', '导出一致');
+  eq(ed.sel, { anchor: 13, head: 13 }, '光标随两处插入平移到新末尾');
+  eq(listRevisions(ed.doc).length, 2, '修订列表一致');
+  // 全偏移 DOM 往返一致
+  const root = renderToFake(ed.doc, ed.sel);
+  const len = textLength(ed.doc);
+  for (let o = 0; o <= len; o++) {
+    const pos = domPositionFromModelOffset(root, o);
+    eq(modelOffsetFromDomPosition(root, pos.node, pos.offset), o, `偏移 ${o} 经 DOM 往返`);
+  }
+  assertValid(ed);
+});
+
+test('IME 组合期间不生成预览、不提交替换、不丢失临时输入', () => {
+  const ed = newEditor();
+  type(ed, '错词错词');
+  const preview = ed.previewReplaceAll('错词', '对词');
+  eq(preview.matches.length, 2);
+  const undoBefore = ed.undoStack.length;
+
+  ed.compositionStart();
+  ed.handleBeforeInput({ inputType: 'insertCompositionText', data: 'ni', isComposing: true });
+  eq(ed.previewReplaceAll('错词', '对词'), null, '组合期间不生成预览');
+  eq(ed.applyReplaceAll(preview), null, '组合期间拒绝提交替换');
+  eq(docText(ed), '错词错词', '文档不变');
+  eq(ed.undoStack.length, undoBefore, '不产生撤销记录');
+  ok(ed.composing, '组合会话仍在，临时输入未被打断');
+
+  ed.compositionEnd('你'); // 组合提交使文档版本前进
+  eq(docText(ed), '错词错词你');
+  eq(ed.applyReplaceAll(preview), null, '组合提交后旧预览过期');
+  const p2 = ed.previewReplaceAll('错词', '对词');
+  eq(ed.applyReplaceAll(p2).applied, 2);
+  eq(docText(ed), '对词对词你');
+  assertValid(ed);
+});
+
 // ---------- 汇总 ----------
 
 console.log(`\n${passed} 通过, ${failed} 失败`);
